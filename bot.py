@@ -68,10 +68,24 @@ claude_client = (
     anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"), timeout=AI_TIMEOUT_MS / 1000)
     if os.getenv("ANTHROPIC_API_KEY") else None
 )
-PRICE = int(os.getenv("PRICE") or "5000")            # 1 ta slayd narxi, so'm
+# TARIFLAR: to'lov summasi (so'm) -> beriladigan SLAYD ballari.
+# Taqdimot narxi = uning jami slayd soni (5, 10, 15 yoki 20 ball). Tarifni o'zgartirmoqchi bo'lsangiz, shu yerni tahrirlang.
+PLANS = {
+    5000: 20,    # 1 ta taqdimot (20 talik yoki 15 talik)
+    10000: 45,   # 3 ta 15 talik  yoki 2 ta 20 talik
+    15000: 60,   # 4 ta 15 talik  yoki 3 ta 20 talik
+    20000: 80,   # 5 ta 15 talik  yoki 4 ta 20 talik
+    25000: 100,  # 6 ta 15 talik  yoki 5 ta 20 talik
+    30000: 120,  # 8 ta 15 talik  yoki 6 ta 20 talik
+    35000: 140,  # 9 ta 15 talik  yoki 7 ta 20 talik
+    40000: 160,  # 10 ta 15 talik yoki 8 ta 20 talik
+    45000: 180,  # 12 ta 15 talik yoki 9 ta 20 talik
+    50000: 200,  # 13 ta 15 talik yoki 10 ta 20 talik
+}
 PROVIDER_TOKEN = os.getenv("PROVIDER_TOKEN") or ""   # BotFather -> Payments (Click/Payme)
+CARD_NUMBER = os.getenv("CARD_NUMBER") or ""          # qo'lda to'lov uchun karta raqami
+CARD_HOLDER = os.getenv("CARD_HOLDER") or ""         # karta egasi (ixtiyoriy)
 ADMIN_ID = int(os.getenv("ADMIN_ID") or "0")         # sizning Telegram ID raqamingiz
-TOPUP_OPTIONS = (10000, 25000, 50000)                # hisobni to'ldirish summalari, so'm
 # Doim tekin foydalanadigan profillar (vergul bilan): FREE_IDS=123456789,987654321
 FREE_IDS_ENV = {int(x) for x in re.findall(r"\d+", os.getenv("FREE_IDS") or "")}
 
@@ -163,6 +177,14 @@ def init_db():
                 created   TEXT DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS free_users (user_id INTEGER PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS card_orders (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                price   INTEGER NOT NULL,
+                credits INTEGER NOT NULL,
+                status  TEXT NOT NULL DEFAULT 'pending',
+                created TEXT DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
 
@@ -214,6 +236,33 @@ def set_free(user_id: int, on: bool):
             conn.execute("INSERT OR IGNORE INTO free_users (user_id) VALUES (?)", (user_id,))
         else:
             conn.execute("DELETE FROM free_users WHERE user_id = ?", (user_id,))
+
+
+# ---- karta orqali qo'lda to'lov buyurtmalari ----
+def create_order(user_id: int, price: int, credits: int) -> int:
+    with closing(db()) as conn, conn:
+        cur = conn.execute("INSERT INTO card_orders (user_id, price, credits) VALUES (?, ?, ?)",
+                           (user_id, price, credits))
+        return cur.lastrowid
+
+
+def get_order(order_id: int):
+    with closing(db()) as conn:
+        return conn.execute("SELECT * FROM card_orders WHERE id = ?", (order_id,)).fetchone()
+
+
+def set_order_status(order_id: int, old: str, new: str) -> bool:
+    """Faqat bir marta o'tadi (ikki marta tasdiqlab, balansni ikki baravar qilib qo'ymaslik uchun)."""
+    with closing(db()) as conn, conn:
+        cur = conn.execute("UPDATE card_orders SET status = ? WHERE id = ? AND status = ?",
+                           (new, order_id, old))
+        return cur.rowcount == 1
+
+
+def count_pending(user_id: int) -> int:
+    with closing(db()) as conn:
+        return conn.execute("SELECT COUNT(*) FROM card_orders WHERE user_id = ? AND status = 'pending'",
+                            (user_id,)).fetchone()[0]
 
 
 def get_user(user_id: int):
@@ -637,7 +686,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_free(update.effective_user.id):
         intro += "\n\n🎁 Sizning profilingiz uchun hammasi TEKIN!"
     else:
-        intro += f"\n\n💵 1 ta slayd — {money(PRICE)}. Hisobni «💰 Balans» bo'limida to'ldirasiz."
+        intro += "\n\n💵 Tarif 5 000 so'mdan boshlanadi (1 ta taqdimot). Tarifni «💰 Balans» bo'limida tanlaysiz."
     if get_user(update.effective_user.id):
         await update.message.reply_text(intro + "\n\nMenyudan tanlang 👇", reply_markup=MENU)
     else:
@@ -677,12 +726,12 @@ async def new_slide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price_note = ""
     if not is_free(uid):
         bal = get_balance(uid)
-        if bal < PRICE:
+        if bal < min(SLIDE_CHOICES):
             return await update.message.reply_text(
-                f"❗ 1 ta slayd {money(PRICE)}, balansingiz {money(bal)}.\nAvval hisobni to'ldiring 👇",
+                f"❗ Balansingiz: {bal} slayd. Taqdimot yaratish uchun tarifni tanlang 👇\n\n" + plans_help(),
                 reply_markup=topup_keyboard(),
             )
-        price_note = f"\n\n💵 Tayyor bo'lganda balansdan {money(PRICE)} yechiladi."
+        price_note = f"\n\n💰 Balansingiz: {bal} slayd. Tanlangan slayd soni balansdan yechiladi."
     context.user_data["step"] = "ask_topic"
     await update.message.reply_text(
         "📝 Slayd mavzusini yozing.\nMasalan: Fotosintez jarayoni" + price_note,
@@ -718,10 +767,12 @@ async def got_topic(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
     )
 
 
-def count_keyboard() -> InlineKeyboardMarkup:
+def count_keyboard(uid=None) -> InlineKeyboardMarkup:
+    bal = None if uid is None or is_free(uid) else get_balance(uid)
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(f"{n} ta", callback_data=f"n:{n}") for n in SLIDE_CHOICES],
+            [InlineKeyboardButton(f"{n} ta" + (" 🔒" if bal is not None and bal < n else ""),
+                                  callback_data=f"n:{n}") for n in SLIDE_CHOICES],
             [InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel")],
         ]
     )
@@ -753,7 +804,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✏️ O'zgartirish", callback_data="edit_profile")]])
     await update.message.reply_text(
         f"👤 Ism: {user['full_name']}\n👥 Guruh: {user['group_name']}\n"
-        f"{'🎁 Tekin profil' if is_free(update.effective_user.id) else '💰 Balans: ' + money(get_balance(update.effective_user.id))}\n\n"
+        f"{'🎁 Tekin profil' if is_free(update.effective_user.id) else '💰 Balans: ' + str(get_balance(update.effective_user.id)) + ' slayd'}\n\n"
         "Bu ma'lumotlar slaydning birinchi sahifasiga yoziladi.",
         reply_markup=kb,
     )
@@ -847,15 +898,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not topic:
             return await q.edit_message_text("Mavzu topilmadi. «🎞 Yangi slayd» tugmasini bosing.")
         return await q.edit_message_text(
-            f"Mavzu: «{topic}»\nUslub: {THEMES[data[2:]]['label']}\n\nNechta slayd kerak? 👇",
-            reply_markup=count_keyboard(),
+            f"Mavzu: «{topic}»\nUslub: {THEMES[data[2:]]['label']}\n{balance_line(update.effective_user.id)}\n"
+            "Nechta slayd kerak? (jami slayd soni balansdan yechiladi; 🔒 — balans yetmaydi) 👇",
+            reply_markup=count_keyboard(update.effective_user.id),
         )
     if data.startswith("n:"):
         total = int(data[2:]) if data[2:].isdigit() else 0
         if total in SLIDE_CHOICES:
             return await generate(update, context, total)
     if data.startswith("t:") and data[2:].isdigit():
-        return await send_topup_invoice(update, context, int(data[2:]))
+        return await choose_method(update, context, int(data[2:]))
+    if data.startswith("ti:") and data[3:].isdigit():
+        return await send_topup_invoice(update, context, int(data[3:]))
+    if data.startswith("tc:") and data[3:].isdigit():
+        return await card_instructions(update, context, int(data[3:]))
+    if data[:3] in ("ap:", "rj:") and data[3:].isdigit():
+        return await review_order(update, context, data.startswith("ap:"), int(data[3:]))
     if data.startswith("h:") and data[2:].isdigit():
         return await send_history_item(update, context, int(data[2:]))
 
@@ -899,10 +957,10 @@ async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE, total: in
     # TO'LOV AVVAL: pul yechilmasa slayd yaratilmaydi (tekin profillar bundan mustasno)
     charged = False
     if not is_free(uid):
-        if not try_charge(uid, PRICE):
+        if not try_charge(uid, total):
             context.user_data["busy"] = False
             return await q.edit_message_text(
-                f"❗ Balans yetarli emas.\n1 ta slayd {money(PRICE)}, balansingiz {money(get_balance(uid))}.",
+                f"❗ Balans yetarli emas.\n{total} ta slayd kerak, balansingiz {get_balance(uid)} slayd.\n\n" + plans_help(),
                 reply_markup=topup_keyboard(),
             )
         charged = True
@@ -933,7 +991,7 @@ async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE, total: in
             document=buf,
             filename=filename,
             caption=f"✅ Tayyor: {data['title']}\n📄 {count} ta slayd · {style_label}"
-            + (f"\n💰 Balans: {money(get_balance(uid))}" if charged else ""),
+            + (f"\n💰 Qoldi: {get_balance(uid)} slayd" if charged else ""),
         )
         add_history(uid, topic, data["title"], count, msg.document.file_id, filename)
         context.user_data.pop("topic", None)
@@ -946,7 +1004,7 @@ async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE, total: in
         await stop_progress()
         log.exception("Slayd yaratishda xato")
         if charged:
-            add_balance(uid, PRICE)  # xato bo'lsa pul qaytariladi
+            add_balance(uid, total)  # xato bo'lsa slaydlar qaytariladi
         reason = str(e) or type(e).__name__
         if "timeout" in type(e).__name__.lower() or "timed out" in reason.lower():
             reason = "AI vaqtida javob bermadi (internet yoki Google serveri sekin)."
@@ -954,7 +1012,7 @@ async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE, total: in
             reason = "AI xizmatlari hozir band yoki sekin. 1-2 daqiqadan keyin qayta urinib ko'ring (kamroq slayd tanlasangiz tezroq bo'ladi)."
         await q.edit_message_text(
             f"❌ Xato: {reason[:300]}"
-            + ("\n💰 Pulingiz balansga qaytarildi." if charged else "")
+            + ("\n💰 Slaydlaringiz balansga qaytarildi." if charged else "")
             + "\n\nQayta urinib ko'ring: «🎞 Yangi slayd»."
         )
     finally:
@@ -979,8 +1037,21 @@ async def send_history_item(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 # ============================================================
 # BALANS VA TO'LOV
 # ============================================================
+def plan_label(price: int) -> str:
+    c = PLANS[price]
+    return f"{money(price)} · 15 talik {c // 15} ta · 20 talik {c // 20} ta"
+
+
+def plans_help() -> str:
+    return "📋 Tariflar (taqdimot soni):\n" + "\n".join(plan_label(p) for p in PLANS)
+
+
+def balance_line(uid: int) -> str:
+    return "" if is_free(uid) else f"💰 Balans: {get_balance(uid)} slayd\n"
+
+
 def topup_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(money(a), callback_data=f"t:{a}")] for a in TOPUP_OPTIONS])
+    return InlineKeyboardMarkup([[InlineKeyboardButton(plan_label(p), callback_data=f"t:{p}")] for p in PLANS])
 
 
 async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -990,15 +1061,16 @@ async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🎁 Sizning profilingiz uchun barcha slaydlar TEKIN. Cheklov yo'q!", reply_markup=MENU
         )
     await update.message.reply_text(
-        f"💰 Balansingiz: {money(get_balance(uid))}\\n💵 1 ta slayd — {money(PRICE)}\\n\\n"
-        "Hisobni to'ldirish uchun summani tanlang 👇",
+        f"💰 Balansingiz: {get_balance(uid)} slayd\n"
+        "Taqdimot narxi uning slayd soniga teng (5, 10, 15 yoki 20).\n\n"
+        "Tarifni tanlang 👇",
         reply_markup=topup_keyboard(),
     )
 
 
 async def send_topup_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE, amount: int):
     q = update.callback_query
-    if amount not in TOPUP_OPTIONS:
+    if amount not in PLANS:
         return
     if not PROVIDER_TOKEN:
         return await q.message.reply_text(
@@ -1007,7 +1079,7 @@ async def send_topup_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE,
     await context.bot.send_invoice(
         chat_id=q.message.chat_id,
         title="Hisobni to'ldirish",
-        description=f"Balansga {money(amount)} qo'shiladi",
+        description=f"Balansga {PLANS[amount]} slayd qo'shiladi",
         payload=f"topup:{amount}",
         provider_token=PROVIDER_TOKEN,
         currency="UZS",
@@ -1023,10 +1095,12 @@ async def on_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pay = update.message.successful_payment
     uid = update.effective_user.id
     amount = pay.total_amount // 100
+    credits = PLANS.get(amount, amount // 250)  # 250 so'm = 1 slayd (zaxira qoida)
     if record_payment(pay.telegram_payment_charge_id, uid, amount):
-        add_balance(uid, amount)
+        add_balance(uid, credits)
     await update.message.reply_text(
-        f"✅ To'lov qabul qilindi: {money(amount)}\\n💰 Balans: {money(get_balance(uid))}", reply_markup=MENU
+        f"✅ To'lov qabul qilindi: {money(amount)}\n➕ {credits} slayd qo'shildi\n"
+        f"💰 Balans: {get_balance(uid)} slayd", reply_markup=MENU
     )
 
 
@@ -1047,9 +1121,9 @@ async def addbalance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         uid, amount = int(context.args[0]), int(context.args[1])
     except (IndexError, ValueError):
-        return await update.message.reply_text("Format: /addbalance <user_id> <summa>")
+        return await update.message.reply_text("Format: /addbalance <user_id> <slayd_soni>")
     add_balance(uid, amount)
-    await update.message.reply_text(f"✅ {uid} balansiga {money(amount)} qo'shildi.")
+    await update.message.reply_text(f"✅ {uid} balansiga {amount} slayd qo'shildi.")
 
 
 async def free_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1072,6 +1146,109 @@ async def unfree_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Format: /unfree <user_id>")
     set_free(uid, False)
     await update.message.reply_text(f"{uid} tekin ro'yxatdan chiqarildi.")
+
+
+# ============================================================
+# KARTA ORQALI QO'LDA TO'LOV (chek yuboriladi, admin tasdiqlaydi)
+# ============================================================
+def method_keyboard(price: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💳 Click / Payme (avtomatik)", callback_data=f"ti:{price}")],
+        [InlineKeyboardButton("🏦 Karta orqali (chek yuborish)", callback_data=f"tc:{price}")],
+    ])
+
+
+async def choose_method(update: Update, context: ContextTypes.DEFAULT_TYPE, price: int):
+    q = update.callback_query
+    if price not in PLANS:
+        return
+    if PROVIDER_TOKEN and CARD_NUMBER:
+        return await q.message.reply_text(
+            f"{plan_label(price)}\n\nTo'lov usulini tanlang 👇", reply_markup=method_keyboard(price)
+        )
+    if PROVIDER_TOKEN:
+        return await send_topup_invoice(update, context, price)
+    if CARD_NUMBER:
+        return await card_instructions(update, context, price)
+    await q.message.reply_text("To'lov tizimi hali ulanmagan. Admin bilan bog'laning.")
+
+
+async def card_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE, price: int):
+    q = update.callback_query
+    if price not in PLANS or not CARD_NUMBER:
+        return
+    context.user_data["receipt_price"] = price
+    holder = f"\n👤 Karta egasi: {CARD_HOLDER}" if CARD_HOLDER else ""
+    await q.message.reply_text(
+        f"🏦 Karta orqali to'lash\n\n"
+        f"💵 Summa: {money(price)} ({PLANS[price]} slayd)\n"
+        f"💳 Karta: {CARD_NUMBER}{holder}\n\n"
+        "1) Aynan shu summani o'tkazing.\n"
+        "2) To'lov chekini (skrinshot) shu yerga RASM qilib yuboring.\n"
+        "3) Admin tekshirib tasdiqlagach, balansingiz to'ladi."
+    )
+
+
+async def on_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    user = update.effective_user
+    price = context.user_data.get("receipt_price")
+    if not price:
+        return await msg.reply_text(
+            "Avval «💰 Balans» bo'limida tarifni tanlang va «Karta orqali» usulini bosing.", reply_markup=MENU
+        )
+    if not ADMIN_ID:
+        return await msg.reply_text("Admin sozlanmagan. Keyinroq urinib ko'ring.")
+    if count_pending(user.id) >= 3:
+        return await msg.reply_text("Sizning 3 ta chekingiz hali tekshirilmoqda. Biroz kuting.")
+
+    oid = create_order(user.id, price, PLANS[price])
+    uname = f"@{user.username}" if user.username else "username yo'q"
+    caption = (
+        f"💳 To'lov cheki #{oid}\n👤 {user.full_name} ({uname})\n🆔 {user.id}\n"
+        f"💵 {money(price)} → {PLANS[price]} slayd"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Tasdiqlash", callback_data=f"ap:{oid}"),
+        InlineKeyboardButton("❌ Rad etish", callback_data=f"rj:{oid}"),
+    ]])
+    try:
+        if msg.photo:
+            await context.bot.send_photo(ADMIN_ID, msg.photo[-1].file_id, caption=caption, reply_markup=kb)
+        else:
+            await context.bot.send_document(ADMIN_ID, msg.document.file_id, caption=caption, reply_markup=kb)
+    except Exception:
+        log.exception("Chekni adminga yuborib bo'lmadi")
+        set_order_status(oid, "pending", "failed")
+        return await msg.reply_text("❌ Chekni adminga yuborib bo'lmadi. Keyinroq urinib ko'ring.")
+    context.user_data.pop("receipt_price", None)
+    await msg.reply_text("✅ Chek adminga yuborildi. Tasdiqlangach balansingiz to'ladi.", reply_markup=MENU)
+
+
+async def review_order(update: Update, context: ContextTypes.DEFAULT_TYPE, approve: bool, oid: int):
+    q = update.callback_query
+    if not ADMIN_ID or q.from_user.id != ADMIN_ID:
+        return
+    order = get_order(oid)
+    if not order:
+        return await q.answer("Buyurtma topilmadi.", show_alert=True)
+    if not set_order_status(oid, "pending", "approved" if approve else "rejected"):
+        return await q.answer("Bu chek allaqachon ko'rib chiqilgan.", show_alert=True)
+    if approve:
+        add_balance(order["user_id"], order["credits"])
+        user_text = (f"✅ To'lovingiz tasdiqlandi!\n➕ {order['credits']} slayd qo'shildi.\n"
+                     f"💰 Balans: {get_balance(order['user_id'])} slayd")
+    else:
+        user_text = "❌ To'lovingiz tasdiqlanmadi. Chek noto'g'ri bo'lsa, qayta urinib ko'ring yoki admin bilan bog'laning."
+    try:
+        await context.bot.send_message(order["user_id"], user_text, reply_markup=MENU)
+    except Exception:
+        log.exception("Foydalanuvchiga xabar yuborib bo'lmadi")
+    status = "✅ TASDIQLANDI" if approve else "❌ RAD ETILDI"
+    try:
+        await q.edit_message_caption(caption=(q.message.caption or "") + f"\n\n{status}")
+    except Exception:
+        pass
 
 
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
@@ -1147,6 +1324,7 @@ def main():
     app.add_handler(CommandHandler("unfree", unfree_cmd))
     app.add_handler(PreCheckoutQueryHandler(on_pre_checkout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_paid))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_receipt))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
