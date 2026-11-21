@@ -5,9 +5,11 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import time
 from contextlib import closing
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 from dotenv import load_dotenv
@@ -833,12 +835,42 @@ async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # ISHGA TUSHIRISH
 # ============================================================
+class _Health(BaseHTTPRequestHandler):
+    """Render bepul tarifi veb-servis (port) talab qiladi. Bu oddiy server UptimeRobot uchun ham javob beradi."""
+
+    def _ok(self, with_body: bool):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        if with_body:
+            self.wfile.write(b"Bot ishlayapti")
+
+    def do_GET(self):
+        self._ok(True)
+
+    def do_HEAD(self):
+        self._ok(False)
+
+    def log_message(self, *args):  # logni to'ldirmaslik uchun
+        pass
+
+
+def start_health_server():
+    port = os.getenv("PORT")  # Render PORT ni o'zi beradi; kompyuterda bo'lmaydi va kerak ham emas
+    if not port:
+        return
+    server = HTTPServer(("0.0.0.0", int(port)), _Health)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("Health-server %s portda ishga tushdi", port)
+
+
 def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN topilmadi. .env faylga BOT_TOKEN=... yozing")
 
     init_db()
+    start_health_server()
 
     def make_request():
         return HTTPXRequest(
@@ -869,6 +901,6 @@ def main():
     print("Bot ishga tushdi ...")
     app.run_polling()
 
-
+  
 if __name__ == "__main__":
     main()
